@@ -17,29 +17,6 @@ import (
 	encasn1 "encoding/asn1"
 )
 
-// OID data we need
-var (
-	OIDData                   = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 1}
-	OIDSignedData             = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 2}
-	OIDDigestAlgorithmSHA256  = encasn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 1}
-	OIDEncryptionAlgorithmRSA = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 1}
-	OIDAttributeContentType   = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 3}
-	OIDAttributeMessageDigest = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 4}
-	OIDAttributeSigningTime   = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 5}
-)
-
-var (
-	ErrNoCertificate = errors.New("no valid certificates")
-)
-
-type Config struct {
-	NoAttr          bool
-	NoCerts         bool
-	AdditionalCerts []*x509.Certificate
-}
-
-type Option func(*Config)
-
 // Control whether or not the authenticated attributes gets hashed
 func NoAttr() Option {
 	return func(c *Config) {
@@ -61,6 +38,27 @@ func WithAdditionalCerts(certs []*x509.Certificate) Option {
 	}
 }
 
+// WithAuthenticodeTimestamp enables authenticode timestamping using the specified TSA URL
+func WithAuthenticodeTimestamp(tsaURL string) Option {
+	return func(c *Config) {
+		c.TimestampURL = tsaURL
+	}
+}
+
+// VerifyTimestamp enables checking the signing certificate for expiry when verifying a signature.
+// If the signing certificate is expired, the Authenticode or RFC3161 timestamp is verified.
+//
+// tsaRoots is the set of trusted root certificates the timestamp signing certificate needs
+// to chain up to. If nil or empty, the system roots or the platform verifier are used.
+func VerifyTimestamp(tsaRoots []*x509.Certificate) VerifyOption {
+	return func(c *VerifyConfig) {
+		c.VerifyTimestamp = true
+		if tsaRoots != nil || len(tsaRoots) > 0 {
+			c.TSARoots = tsaRoots
+		}
+	}
+}
+
 // Partially implements RFC2315
 func SignPKCS7(signer crypto.Signer, cert *x509.Certificate, oid encasn1.ObjectIdentifier, content []byte, opts ...Option) ([]byte, error) {
 	config := &Config{}
@@ -72,6 +70,7 @@ func SignPKCS7(signer crypto.Signer, cert *x509.Certificate, oid encasn1.ObjectI
 
 	h := crypto.SHA256.New()
 	h.Write(content)
+	contentDigest := h.Sum(nil)
 
 	var attributes []byte
 	if !config.NoAttr {
@@ -83,9 +82,10 @@ func SignPKCS7(signer crypto.Signer, cert *x509.Certificate, oid encasn1.ObjectI
 		// - OIDAttributeMessageDigest
 		attrs := &Attributes{
 			ContentType:   oid,
-			MessageDigest: h.Sum(nil),
+			MessageDigest: contentDigest,
 			SigningTime:   time.Now().UTC(),
 		}
+
 		attributes = attrs.Marshal()
 		h = crypto.SHA256.New()
 		h.Write(attributes)
@@ -94,6 +94,16 @@ func SignPKCS7(signer crypto.Signer, cert *x509.Certificate, oid encasn1.ObjectI
 	sig, err := signer.Sign(rand.Reader, h.Sum(nil), crypto.SHA256)
 	if err != nil {
 		return nil, err
+	}
+
+	var timestamp []byte
+	if config.TimestampURL != "" {
+		sigHash := crypto.SHA256.New()
+		sigHash.Write(sig)
+		timestamp, err = GetTimestamp(config.TimestampURL, sigHash.Sum(nil))
+		if err != nil {
+			return nil, fmt.Errorf("failed to get timestamp for unauthenticated attributes: %w", err)
+		}
 	}
 
 	// ContentInfo ::= SEQUENCE
@@ -134,9 +144,13 @@ func SignPKCS7(signer crypto.Signer, cert *x509.Certificate, oid encasn1.ObjectI
 					// content [0] EXPLICIT DEFINED BY contentType OPTIONAL
 					if len(content) > 0 && !oid.Equal(OIDData) {
 						b.AddASN1(asn1.Tag(0).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
-							b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
-								b.AddBytes(content)
-							})
+							if oid.Equal(OIDAttributeTSTInfo) {
+								b.AddASN1OctetString(content)
+							} else {
+								b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
+									b.AddBytes(content)
+								})
+							}
 						})
 					}
 				})
@@ -183,7 +197,7 @@ func SignPKCS7(signer crypto.Signer, cert *x509.Certificate, oid encasn1.ObjectI
 							b.AddASN1NULL()
 						})
 
-						if !config.NoAttr {
+						if len(attributes) > 0 {
 							// authenticatedAttributes [0] IMPLICIT Attributes OPTIONAL
 							b.AddASN1(asn1.Tag(0).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
 								attrsOuter := cryptobyte.String(attributes)
@@ -205,7 +219,18 @@ func SignPKCS7(signer crypto.Signer, cert *x509.Certificate, oid encasn1.ObjectI
 						b.AddASN1OctetString(sig)
 
 						// unauthenticatedAttributes [1] IMPLICIT Attributes OPTIONAL
-						// Not used
+						if len(timestamp) > 0 {
+							// Add unauthenticated attributes with timestamp
+							b.AddASN1(asn1.Tag(1).ContextSpecific().Constructed(), func(b *cryptobyte.Builder) {
+								// Single timestamp attribute
+								b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
+									b.AddASN1ObjectIdentifier(OIDAttributeMicrosoftTimeStamp)
+									b.AddASN1(asn1.SET, func(b *cryptobyte.Builder) {
+										b.AddBytes(timestamp)
+									})
+								})
+							})
+						}
 					})
 				})
 			})
@@ -281,11 +306,6 @@ func parseCertificates(der *cryptobyte.String) ([]*x509.Certificate, error) {
 	return certs, nil
 }
 
-type issuerAndSerialNumber struct {
-	RawIssuer    []byte
-	SerialNumber *big.Int
-}
-
 func parseIssuerAndSerialNumber(der *cryptobyte.String) (*issuerAndSerialNumber, error) {
 	// TODO: We don't really use it yet. Expose error
 	var s cryptobyte.String
@@ -308,17 +328,32 @@ func parseIssuerAndSerialNumber(der *cryptobyte.String) (*issuerAndSerialNumber,
 	return &ias, nil
 }
 
-func parseAttributes(der *cryptobyte.String) (*Attributes, error) {
+func parseAttributes(der *cryptobyte.String, tag int) (*Attributes, error) {
 	var attributes Attributes
 	var attrs cryptobyte.String
 	var hasAttrs bool
 
-	if !der.ReadOptionalASN1(&attrs, &hasAttrs, asn1.Tag(0).ContextSpecific().Constructed()) {
+	if !der.ReadOptionalASN1(&attrs, &hasAttrs, asn1.Tag(tag).ContextSpecific().Constructed()) {
 		return nil, errors.New("malformed attributes")
 	}
 
 	if !hasAttrs {
 		return nil, nil
+	}
+
+	// Store the original raw bytes for signature verification
+	if tag == 1 {
+		// For unauthenticated attributes (tag 1) we use the raw bytes directly
+		attributes.RawBytes = []byte(attrs)
+	} else {
+		// For authenticated attributes (tag 0) we need to wrap in a SET
+		// This is because the IMPLICIT [0] tag is not used for DER encoding
+		// See https://tools.ietf.org/html/rfc2315#section-9.3
+		b := cryptobyte.NewBuilder(nil)
+		b.AddASN1(asn1.SET, func(b *cryptobyte.Builder) {
+			b.AddBytes(attrs)
+		})
+		attributes.RawBytes = b.BytesOrPanic()
 	}
 
 	var contentType cryptobyte.String
@@ -354,6 +389,8 @@ func parseAttributes(der *cryptobyte.String) (*Attributes, error) {
 			if !contentType.ReadASN1UTCTime(&attributes.SigningTime) {
 				return nil, errors.New("could not parse Signing Time")
 			}
+		case contentOID.Equal(OIDAttributeMicrosoftTimeStamp):
+			attributes.TimestampToken = contentType
 		default:
 			// Save the bytes for any attributes we are not parsing.
 			attributes.Other = append(attributes.Other, &unparsedAttribute{
@@ -368,7 +405,7 @@ func parseAttributes(der *cryptobyte.String) (*Attributes, error) {
 func parseEncryptedDigest(der *cryptobyte.String) ([]byte, error) {
 	var encryptedDigest cryptobyte.String
 	if !der.ReadASN1(&encryptedDigest, asn1.OCTET_STRING) {
-		return nil, errors.New("malfomed encrypted digest")
+		return nil, fmt.Errorf("encrypted digest: %w", ErrOctetString)
 	}
 	return encryptedDigest, nil
 }
@@ -400,8 +437,8 @@ func parseSignerInfos(der *cryptobyte.String) (*signerinfo, error) {
 	}
 	si.DigestAlgorithm = algid
 
-	//attributes
-	attrs, err := parseAttributes(&signerInfo)
+	// authenticated attributes - tag 0
+	attrs, err := parseAttributes(&signerInfo, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed parsing attributes: %w", err)
 	}
@@ -420,20 +457,18 @@ func parseSignerInfos(der *cryptobyte.String) (*signerinfo, error) {
 	}
 	si.EncryptedDigest = digest
 
+	// unauthenticated attributes - tag 1
+	unauthAttrs, err := parseAttributes(&signerInfo, 1)
+	if err != nil {
+		return nil, fmt.Errorf("failed parsing unauthenticated attributes: %w", err)
+	}
+	si.UnauthenticatedAttributes = unauthAttrs
+
 	return &si, nil
 }
 
-type signerinfo struct {
-	Version                  int64
-	EncryptedDigest          []byte
-	DigestAlgorithm          *pkix.AlgorithmIdentifier
-	AuthenticatedAttributes  *Attributes
-	EncryptedDigestAlgorithm *pkix.AlgorithmIdentifier
-	IssuerAndSerialnumber    *issuerAndSerialNumber
-}
-
 func (s *signerinfo) verify(cert *x509.Certificate) (bool, error) {
-	sigdata := s.AuthenticatedAttributes.Marshal()
+	sigdata := s.AuthenticatedAttributes.RawBytes
 	err := cert.CheckSignature(x509.SHA256WithRSA, sigdata, s.EncryptedDigest)
 	if err != nil {
 		return false, err
@@ -451,15 +486,28 @@ func (s *signerinfo) isCertificate(cert *x509.Certificate) bool {
 	return true
 }
 
-type PKCS7 struct {
-	OID                 encasn1.ObjectIdentifier
-	SignerInfo          []*signerinfo
-	ContentInfo         []byte
-	Certs               []*x509.Certificate
-	AlgorithmIdentifier *pkix.AlgorithmIdentifier
+func (s *signerinfo) verifyTimestamp(cert *x509.Certificate, opts ...VerifyOption) (bool, error) {
+	if s.UnauthenticatedAttributes == nil || len(s.UnauthenticatedAttributes.TimestampToken) == 0 {
+		return false, errors.New("no timestamp token found in unauthenticated attributes")
+	}
+
+	h := digestAlgorithmHashFunction[s.DigestAlgorithm.Algorithm.String()].New()
+	h.Write(s.EncryptedDigest) // message imprint inside the timestamp token
+	imprintHash := h.Sum(nil)
+
+	err := VerifyTimestampBytes(s.UnauthenticatedAttributes.TimestampToken, imprintHash, cert, opts...)
+	if err != nil {
+		return false, fmt.Errorf("failed to verify timestamp: %w", err)
+	}
+	return true, nil
 }
 
-func (p *PKCS7) Verify(cert *x509.Certificate) (bool, error) {
+func (p *PKCS7) Verify(cert *x509.Certificate, opts ...VerifyOption) (bool, error) {
+	c := &VerifyConfig{}
+	for _, optFunc := range opts {
+		optFunc(c)
+	}
+
 	for _, si := range p.SignerInfo {
 		if !si.isCertificate(cert) {
 			continue
@@ -470,6 +518,9 @@ func (p *PKCS7) Verify(cert *x509.Certificate) (bool, error) {
 		}
 		if !ok {
 			continue
+		}
+		if cert.NotAfter.Before(time.Now()) && c.VerifyTimestamp {
+			return si.verifyTimestamp(cert, opts...)
 		}
 		return true, nil
 	}
@@ -550,54 +601,4 @@ func ParsePKCS7(b []byte) (*PKCS7, error) {
 	}
 
 	return &pkcs, nil
-}
-
-type unparsedAttribute struct {
-	Type  encasn1.ObjectIdentifier
-	Bytes []byte
-}
-
-type Attributes struct {
-	ContentType   encasn1.ObjectIdentifier
-	MessageDigest []byte
-	SigningTime   time.Time
-	Other         []*unparsedAttribute
-}
-
-func (a *Attributes) Marshal() []byte {
-	b := cryptobyte.NewBuilder(nil)
-	// Attributes := SET OF Attribute
-	b.AddASN1(asn1.SET, func(b *cryptobyte.Builder) {
-		// Add the content type
-		b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
-			b.AddASN1ObjectIdentifier(OIDAttributeContentType)
-			b.AddASN1(asn1.SET, func(b *cryptobyte.Builder) {
-				b.AddASN1ObjectIdentifier(a.ContentType)
-			})
-		})
-		if !a.SigningTime.IsZero() {
-			b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
-				b.AddASN1ObjectIdentifier(OIDAttributeSigningTime)
-				b.AddASN1(asn1.SET, func(b *cryptobyte.Builder) {
-					b.AddASN1UTCTime(a.SigningTime)
-				})
-			})
-		}
-		// Digest from Authenticode
-		b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
-			b.AddASN1ObjectIdentifier(OIDAttributeMessageDigest)
-			b.AddASN1(asn1.SET, func(b *cryptobyte.Builder) {
-				b.AddASN1OctetString(a.MessageDigest)
-			})
-		})
-		for _, attr := range a.Other {
-			b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
-				b.AddASN1ObjectIdentifier(attr.Type)
-				b.AddASN1(asn1.SET, func(b *cryptobyte.Builder) {
-					b.AddBytes(attr.Bytes)
-				})
-			})
-		}
-	})
-	return b.BytesOrPanic()
 }
