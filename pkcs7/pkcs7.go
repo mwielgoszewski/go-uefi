@@ -17,6 +17,61 @@ import (
 	encasn1 "encoding/asn1"
 )
 
+// OID data we need
+var (
+	OIDData                        = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 1}
+	OIDSignedData                  = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 2}
+	OIDDigestAlgorithmSHA256       = encasn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 1}
+	OIDDigestAlgorithmSHA384       = encasn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 2}
+	OIDDigestAlgorithmSHA512       = encasn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 3}
+	OIDEncryptionAlgorithmRSA      = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 1}
+	OIDAttributeContentType        = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 3}
+	OIDAttributeMessageDigest      = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 4}
+	OIDAttributeSigningTime        = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 5}
+	OIDAttributeTSTInfo            = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 16, 1, 4}
+	OIDAttributeRFC3161TimeStamp   = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 16, 2, 14}
+	OIDAttributeMicrosoftTimeStamp = encasn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 3, 3, 1}
+)
+
+var digestAlgorithmHashFunction = map[string]crypto.Hash{
+	OIDDigestAlgorithmSHA256.String(): crypto.SHA256,
+	OIDDigestAlgorithmSHA384.String(): crypto.SHA384,
+	OIDDigestAlgorithmSHA512.String(): crypto.SHA512,
+}
+
+// Common errors
+var (
+	// ASN.1 parsing errors
+	ErrInteger     = errors.New("expected INTEGER")
+	ErrObjectID    = errors.New("expected OBJECT IDENTIFIER")
+	ErrNull        = errors.New("expected NULL")
+	ErrSequence    = errors.New("expected SEQUENCE")
+	ErrOctetString = errors.New("expected OCTET STRING")
+
+	// PKCS7 processing errors
+	ErrNoCertificate     = errors.New("no valid certificates")
+	ErrTimestampRequest  = errors.New("timestamp request failed")
+	ErrTimestampResponse = errors.New("invalid timestamp response")
+	ErrTimestampVerify   = errors.New("timestamp verification failed")
+)
+
+type Config struct {
+	NoAttr                   bool
+	NoCerts                  bool
+	AdditionalCerts          []*x509.Certificate
+	TimestampURL             string
+	UseMicrosoftTimestampOID bool
+}
+
+type Option func(*Config)
+
+type VerifyConfig struct {
+	VerifyTimestamp bool
+	TSARoots        []*x509.Certificate // Trusted root CAs for TSA certificates
+}
+
+type VerifyOption func(*VerifyConfig)
+
 // Control whether or not the authenticated attributes gets hashed
 func NoAttr() Option {
 	return func(c *Config) {
@@ -294,16 +349,57 @@ func ParseContentInfo(der *cryptobyte.String) (oid encasn1.ObjectIdentifier, con
 	return
 }
 
-func parseCertificates(der *cryptobyte.String) ([]*x509.Certificate, error) {
+func parseCertificates(der *cryptobyte.String) ([]*x509.Certificate, []byte, error) {
 	var raw cryptobyte.String
-	if !der.ReadOptionalASN1(&raw, nil, asn1.Tag(0).ContextSpecific().Constructed()) {
-		return nil, errors.New("no certificates")
+	var hasCerts bool
+	if !der.ReadOptionalASN1(&raw, &hasCerts, asn1.Tag(0).ContextSpecific().Constructed()) {
+		return nil, nil, errors.New("failed to read certificates tag")
 	}
-	certs, err := x509.ParseCertificates(raw)
-	if err != nil {
-		return nil, fmt.Errorf("failed parsing certificates: %w", err)
+	// Certificates are optional in PKCS#7
+	if !hasCerts {
+		return nil, nil, nil
 	}
-	return certs, nil
+
+	// Parse certificates one by one to handle malformed PKCS#7 structures.
+	// Some Microsoft Authenticode timestamps incorrectly nest [1] tags (containing countersignature
+	// data from nested timestamp SignerInfos) inside the [0] certificates section, violating both
+	// RFC 5652 and Microsoft's own Authenticode PE specification which require [0] and [1] to be
+	// siblings. By parsing cert-by-cert and stopping at non-SEQUENCE data, we extract both the
+	// valid certificates and preserve any malformed trailing data for inspection.
+	var certs []*x509.Certificate
+	for !raw.Empty() {
+		// Save the current state before attempting to read
+		rawCopy := raw
+
+		var certDER cryptobyte.String
+		// Try to read a SEQUENCE (certificate) - use ReadASN1Element to get the complete DER
+		if !raw.ReadASN1Element(&certDER, asn1.SEQUENCE) {
+			// Not a certificate SEQUENCE, stop parsing (hit non-certificate data)
+			// Restore raw to the state before the failed read
+			raw = rawCopy
+			break
+		}
+
+		// Parse this single certificate
+		cert, err := x509.ParseCertificate(certDER)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed parsing certificate: %w", err)
+		}
+		certs = append(certs, cert)
+	}
+
+	// Preserve any remaining data that was malformed/misplaced
+	var malformedData []byte
+	if !raw.Empty() {
+		malformedData = []byte(raw)
+	}
+
+	return certs, malformedData, nil
+}
+
+type issuerAndSerialNumber struct {
+	RawIssuer    []byte
+	SerialNumber *big.Int
 }
 
 func parseIssuerAndSerialNumber(der *cryptobyte.String) (*issuerAndSerialNumber, error) {
@@ -467,6 +563,17 @@ func parseSignerInfos(der *cryptobyte.String) (*signerinfo, error) {
 	return &si, nil
 }
 
+type signerinfo struct {
+	Version                   int64
+	EncryptedDigest           []byte
+	DigestAlgorithm           *pkix.AlgorithmIdentifier
+	AuthenticatedAttributes   *Attributes
+	EncryptedDigestAlgorithm  *pkix.AlgorithmIdentifier
+	IssuerAndSerialnumber     *issuerAndSerialNumber
+	UnauthenticatedAttributes *Attributes
+	TimestampToken            []byte // Store timestamp for unauthenticated attributes
+}
+
 func (s *signerinfo) verify(cert *x509.Certificate) (bool, error) {
 	sigdata := s.AuthenticatedAttributes.RawBytes
 	err := cert.CheckSignature(x509.SHA256WithRSA, sigdata, s.EncryptedDigest)
@@ -500,6 +607,19 @@ func (s *signerinfo) verifyTimestamp(cert *x509.Certificate, opts ...VerifyOptio
 		return false, fmt.Errorf("failed to verify timestamp: %w", err)
 	}
 	return true, nil
+}
+
+type PKCS7 struct {
+	OID                 encasn1.ObjectIdentifier
+	SignerInfo          []*signerinfo
+	ContentInfo         []byte
+	Certs               []*x509.Certificate
+	AlgorithmIdentifier *pkix.AlgorithmIdentifier
+
+	// MalformedCertData contains any non-certificate data found in the [0] certificates section.
+	// Some malformed Authenticode signatures incorrectly nest [1] countersignature/timestamp data
+	// inside the [0] section. This field preserves that data for inspection or recovery.
+	MalformedCertData []byte
 }
 
 func (p *PKCS7) Verify(cert *x509.Certificate, opts ...VerifyOption) (bool, error) {
@@ -581,11 +701,16 @@ func ParsePKCS7(b []byte) (*PKCS7, error) {
 	pkcs.OID = oid
 	pkcs.ContentInfo = content
 
-	certs, err := parseCertificates(&signedData)
+	certs, malformedData, err := parseCertificates(&signedData)
 	if err != nil {
 		return nil, fmt.Errorf("failed parsing certificates: %w", err)
 	}
 	pkcs.Certs = certs
+	pkcs.MalformedCertData = malformedData
+
+	// Skip optional CRLs [1] IMPLICIT - we don't use them but need to skip past them
+	var crls cryptobyte.String
+	signedData.ReadOptionalASN1(&crls, nil, asn1.Tag(1).ContextSpecific().Constructed())
 
 	var signerInfo cryptobyte.String
 
@@ -601,4 +726,56 @@ func ParsePKCS7(b []byte) (*PKCS7, error) {
 	}
 
 	return &pkcs, nil
+}
+
+type unparsedAttribute struct {
+	Type  encasn1.ObjectIdentifier
+	Bytes []byte
+}
+
+type Attributes struct {
+	ContentType    encasn1.ObjectIdentifier
+	MessageDigest  []byte
+	SigningTime    time.Time
+	TimestampToken []byte
+	Other          []*unparsedAttribute
+	RawBytes       []byte // Store the original DER bytes for signature verification
+}
+
+func (a *Attributes) Marshal() []byte {
+	b := cryptobyte.NewBuilder(nil)
+	// Attributes := SET OF Attribute
+	b.AddASN1(asn1.SET, func(b *cryptobyte.Builder) {
+		// Add the content type
+		b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
+			b.AddASN1ObjectIdentifier(OIDAttributeContentType)
+			b.AddASN1(asn1.SET, func(b *cryptobyte.Builder) {
+				b.AddASN1ObjectIdentifier(a.ContentType)
+			})
+		})
+		if !a.SigningTime.IsZero() {
+			b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
+				b.AddASN1ObjectIdentifier(OIDAttributeSigningTime)
+				b.AddASN1(asn1.SET, func(b *cryptobyte.Builder) {
+					b.AddASN1UTCTime(a.SigningTime)
+				})
+			})
+		}
+		// Digest from Authenticode
+		b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
+			b.AddASN1ObjectIdentifier(OIDAttributeMessageDigest)
+			b.AddASN1(asn1.SET, func(b *cryptobyte.Builder) {
+				b.AddASN1OctetString(a.MessageDigest)
+			})
+		})
+		for _, attr := range a.Other {
+			b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
+				b.AddASN1ObjectIdentifier(attr.Type)
+				b.AddASN1(asn1.SET, func(b *cryptobyte.Builder) {
+					b.AddBytes(attr.Bytes)
+				})
+			})
+		}
+	})
+	return b.BytesOrPanic()
 }

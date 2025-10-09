@@ -98,7 +98,7 @@ func TestParseTimestampInfo(t *testing.T) {
 		GenTime:      time.Now().UTC(),
 	}
 
-	tstInfoBytes, err := encasn1.Marshal(tstInfo)
+	tstInfoBytes, err := tstInfo.Marshal()
 	if err != nil {
 		t.Fatalf("Failed to marshal TSTInfo: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestVerifyTimestampValidation(t *testing.T) {
 		GenTime:      time.Now().UTC(),
 	}
 
-	tstInfoBytes, err := encasn1.Marshal(tstInfo)
+	tstInfoBytes, err := tstInfo.Marshal()
 	if err != nil {
 		t.Fatalf("Failed to marshal TSTInfo: %v", err)
 	}
