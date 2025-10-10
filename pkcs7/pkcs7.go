@@ -360,12 +360,13 @@ func parseCertificates(der *cryptobyte.String) ([]*x509.Certificate, []byte, err
 		return nil, nil, nil
 	}
 
-	// Parse certificates one by one to handle malformed PKCS#7 structures.
-	// Some Microsoft Authenticode timestamps incorrectly nest [1] tags (containing countersignature
-	// data from nested timestamp SignerInfos) inside the [0] certificates section, violating both
-	// RFC 5652 and Microsoft's own Authenticode PE specification which require [0] and [1] to be
-	// siblings. By parsing cert-by-cert and stopping at non-SEQUENCE data, we extract both the
-	// valid certificates and preserve any malformed trailing data for inspection.
+	// Parse certificates one by one to handle extended certificate types in CertificateSet.
+	// RFC 5652 CertificateSet can contain X.509 certificates (untagged SEQUENCE) as well as
+	// [0] extended certificates, [1] v1 attribute certificates, and [2] v2 attribute certificates.
+	// Some Thales TSS timestamp servers place Time Attribute Certificates (TAC) in the [1] slot
+	// ("CertificateChoices1 with ESSCertID compatibility mode"). By parsing cert-by-cert and
+	// stopping at non-SEQUENCE data, we extract X.509 certificates and preserve any tagged
+	// certificate data (attribute certificates, etc.) for separate handling.
 	var certs []*x509.Certificate
 	for !raw.Empty() {
 		// Save the current state before attempting to read
@@ -388,13 +389,13 @@ func parseCertificates(der *cryptobyte.String) ([]*x509.Certificate, []byte, err
 		certs = append(certs, cert)
 	}
 
-	// Preserve any remaining data that was malformed/misplaced
-	var malformedData []byte
+	// Preserve any remaining tagged certificate data (attribute certificates, etc.)
+	var extendedCertData []byte
 	if !raw.Empty() {
-		malformedData = []byte(raw)
+		extendedCertData = []byte(raw)
 	}
 
-	return certs, malformedData, nil
+	return certs, extendedCertData, nil
 }
 
 type issuerAndSerialNumber struct {
@@ -616,10 +617,11 @@ type PKCS7 struct {
 	Certs               []*x509.Certificate
 	AlgorithmIdentifier *pkix.AlgorithmIdentifier
 
-	// MalformedCertData contains any non-certificate data found in the [0] certificates section.
-	// Some malformed Authenticode signatures incorrectly nest [1] countersignature/timestamp data
-	// inside the [0] section. This field preserves that data for inspection or recovery.
-	MalformedCertData []byte
+	// ExtendedCertData contains any non-X.509 certificate data found in the certificates section.
+	// Per RFC 5652, CertificateSet can include [0] extended certificates, [1] v1 attribute
+	// certificates (e.g., Time Attribute Certificates from Thales TSS), and [2] v2 attribute
+	// certificates. This field preserves that tagged data for inspection or specialized parsing.
+	ExtendedCertData []byte
 }
 
 func (p *PKCS7) Verify(cert *x509.Certificate, opts ...VerifyOption) (bool, error) {
@@ -701,12 +703,12 @@ func ParsePKCS7(b []byte) (*PKCS7, error) {
 	pkcs.OID = oid
 	pkcs.ContentInfo = content
 
-	certs, malformedData, err := parseCertificates(&signedData)
+	certs, extendedCertData, err := parseCertificates(&signedData)
 	if err != nil {
 		return nil, fmt.Errorf("failed parsing certificates: %w", err)
 	}
 	pkcs.Certs = certs
-	pkcs.MalformedCertData = malformedData
+	pkcs.ExtendedCertData = extendedCertData
 
 	// Skip optional CRLs [1] IMPLICIT - we don't use them but need to skip past them
 	var crls cryptobyte.String
